@@ -34,4 +34,153 @@
     min-height: 100%;
     display: flex; flex-direction: column; justify-content: center;
     gap: 14px; max-width: 420px; margin: 0 auto;
-    padding: calc(24px + env(safe-area-inset-top, 0px)) 24px calc(24
+    padding: calc(24px + env(safe-area-inset-top, 0px)) 24px calc(24px + env(safe-area-inset-bottom, 0px));
+  }
+  h1 { font-size: 2.4rem; margin: 0; letter-spacing: -0.02em; }
+  p { margin: 0; line-height: 1.45; }
+  input {
+    font: inherit; padding: 14px; border-radius: 10px;
+    border: 2px solid var(--ink); background: var(--card); color: var(--ink);
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 14px; border: 0; border-radius: 10px;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  #call { display: none; position: fixed; inset: 0; background: #000; }
+  #remote { width: 100%; height: 100%; object-fit: cover; background: #000; }
+  #local {
+    position: absolute; right: 12px; width: 28vw; max-width: 140px; aspect-ratio: 3/4;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    object-fit: cover; border-radius: 12px; border: 2px solid #fff; background: #222;
+    transform: scaleX(-1);
+  }
+  #status {
+    position: absolute; left: 12px; top: calc(12px + env(safe-area-inset-top, 0px));
+    background: rgba(0,0,0,.6); color: #fff; padding: 8px 12px; border-radius: 10px; font-size: .9rem;
+  }
+  #controls {
+    position: absolute; left: 0; right: 0; display: flex; justify-content: center; gap: 12px;
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  }
+  #controls button { min-width: 96px; background: rgba(255,255,255,.2); backdrop-filter: blur(6px); }
+  #controls #hang { background: var(--danger); color: #fff; }
+</style>
+</head>
+<body>
+  <main id="lobby">
+    <h1>Faceapp</h1>
+    <p>Pick a room name, then share it with a friend. Both of you enter the same name to start a video call.</p>
+    <input id="room" placeholder="Room name" autocomplete="off" autocapitalize="none" aria-label="Room name">
+    <button id="join">Start call</button>
+    <p id="error" role="alert" style="color:var(--danger)"></p>
+  </main>
+
+  <section id="call">
+    <video id="remote" autoplay playsinline></video>
+    <video id="local" autoplay playsinline muted></video>
+    <div id="status">Connecting...</div>
+    <div id="controls">
+      <button id="mute">Mute</button>
+      <button id="cam">Camera off</button>
+      <button id="hang">End</button>
+    </div>
+  </section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+let ws, pc, localStream, room;
+
+$("room").value = location.hash.slice(1);
+
+$("join").onclick = async () => {
+  room = $("room").value.trim().toLowerCase();
+  if (!room) { $("error").textContent = "Enter a room name."; return; }
+  $("error").textContent = "";
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" }, audio: true
+    });
+  } catch (e) {
+    $("error").textContent = "Allow camera and microphone access, then try again.";
+    return;
+  }
+  $("local").srcObject = localStream;
+  $("lobby").style.display = "none";
+  $("call").style.display = "block";
+  connect();
+};
+
+function setStatus(t) { $("status").textContent = t; }
+  function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: "join", room }));
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "joined") {
+      setStatus(msg.count === 1 ? "Waiting for someone to join..." : "Connecting...");
+    } else if (msg.type === "full") {
+      hangUp("That room already has two people.");
+    } else if (msg.type === "ready") {
+      makePeer();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription }));
+    } else if (msg.type === "offer") {
+      makePeer();
+      await pc.setRemoteDescription(msg.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription }));
+    } else if (msg.type === "answer") {
+      await pc.setRemoteDescription(msg.sdp);
+    } else if (msg.type === "candidate" && pc) {
+      try { await pc.addIceCandidate(msg.candidate); } catch {}
+    } else if (msg.type === "left") {
+      setStatus("The other person left.");
+      $("remote").srcObject = null;
+      if (pc) { pc.close(); pc = null; }
+    }
+  };
+  ws.onclose = () => setStatus("Disconnected.");
+}
+
+function makePeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection(rtcConfig);
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.ontrack = (e) => { $("remote").srcObject = e.streams[0]; setStatus("Connected"); };
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate }));
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc && pc.connectionState === "failed") setStatus("Connection failed. A TURN server may be needed.");
+  };
+}
+
+function hangUp(message) {
+  if (pc) pc.close();
+  if (ws) ws.close();
+  if (localStream) localStream.getTracks().forEach((t) => t.stop());
+  pc = ws = localStream = null;
+  $("call").style.display = "none";
+  $("lobby").style.display = "flex";
+  $("error").textContent = message || "";
+}
+
+$("hang").onclick = () => hangUp();
+$("mute").onclick = () => {
+  const t = localStream.getAudioTracks()[0];
+  t.enabled = !t.enabled;
+  $("mute").textContent = t.enabled ? "Mute" : "Unmute";
+};
+$("cam").onclick = () => {
+  const t = localStream.getVideoTracks()[0];
+  t.enabled = !t.enabled;
+  $("cam").textContent = t.enabled ? "Camera off" : "Camera on";
+};
+</script>
+</body>
+</html>
